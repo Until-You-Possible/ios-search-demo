@@ -1,94 +1,168 @@
-//
-//  RecognitionViewModel.swift
-//  gatherSwiftUISearch
-//
-//  Created by Ray on 2023/3/9.
-//
 
+
+import AVFoundation
 import Foundation
 import Speech
+import SwiftUI
 
-
-class RecognitionViewModel: ObservableObject {
-    
-    public var isRecording = false
-    @Published var recognizedText = "user speech"
-    public let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
-    public var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    public var recognitionTask: SFSpeechRecognitionTask?
-    public let audioEngine = AVAudioEngine()
-    
-    init() {
+/// A helper for transcribing speech to text using SFSpeechRecognizer and AVAudioEngine.
+class SpeechRecognizer: ObservableObject {
+    enum RecognizerError: Error {
+        case nilRecognizer
+        case notAuthorizedToRecognize
+        case notPermittedToRecord
+        case recognizerIsUnavailable
         
-    }
-    
-    func recording () {
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            self.recognitionRequest?.endAudio()
-            self.isRecording = false
-        } else {
-            startRecording()
-            self.isRecording = true
+        var message: String {
+            switch self {
+            case .nilRecognizer: return "Can't initialize speech recognizer"
+            case .notAuthorizedToRecognize: return "Not authorized to recognize speech"
+            case .notPermittedToRecord: return "Not permitted to record audio"
+            case .recognizerIsUnavailable: return "Recognizer is unavailable"
+            }
         }
     }
     
+    @Published var transcript: String = "---"
     
-    func startRecording() {
-        self.recognitionTask?.cancel()
-        self.recognitionTask = nil
-
+    private var audioEngine: AVAudioEngine?
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let recognizer: SFSpeechRecognizer?
+    
+    /**
+     Initializes a new speech recognizer. If this is the first time you've used the class, it
+     requests access to the speech recognizer and the microphone.
+     */
+    init() {
+        recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
+        
+        Task(priority: .background) {
+            do {
+                guard recognizer != nil else {
+                    throw RecognizerError.nilRecognizer
+                }
+                guard await SFSpeechRecognizer.hasAuthorizationToRecognize() else {
+                    throw RecognizerError.notAuthorizedToRecognize
+                }
+                guard await AVAudioSession.sharedInstance().hasPermissionToRecord() else {
+                    throw RecognizerError.notPermittedToRecord
+                }
+            } catch {
+                speakError(error)
+            }
+        }
+    }
+    
+    deinit {
+        reset()
+    }
+    
+    /**
+        Begin transcribing audio.
+        Creates a `SFSpeechRecognitionTask` that transcribes speech to text until you call `stopTranscribing()`.
+        The resulting transcription is continuously written to the published `transcript` property.
+     */
+    func transcribe() {
+        DispatchQueue(label: "Speech Recognizer Queue", qos: .background).async { [weak self] in
+            guard let self = self, let recognizer = self.recognizer, recognizer.isAvailable else {
+                self?.speakError(RecognizerError.recognizerIsUnavailable)
+                return
+            }
+            
+            do {
+                let (audioEngine, request) = try Self.prepareEngine()
+                self.audioEngine = audioEngine
+                self.request = request
+                self.task = recognizer.recognitionTask(with: request, resultHandler: self.recognitionHandler(result:error:))
+            } catch {
+                self.reset()
+                self.speakError(error)
+            }
+        }
+    }
+    
+    /// Stop transcribing audio.
+    func stopTranscribing() {
+        reset()
+    }
+    
+    /// Reset the speech recognizer.
+    func reset() {
+        task?.cancel()
+        audioEngine?.stop()
+        audioEngine = nil
+        request = nil
+        task = nil
+    }
+    
+    private static func prepareEngine() throws -> (AVAudioEngine, SFSpeechAudioBufferRecognitionRequest) {
+        let audioEngine = AVAudioEngine()
+        
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        
         let audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
-            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        } catch {
-            print("Failed to set audio session category.")
-        }
-
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-
+        try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         let inputNode = audioEngine.inputNode
         
-//        guard let inputNode = audioEngine.inputNode else {
-//            fatalError("Audio engine has no input node.")
-//        }
-        guard let recognitionRequest = recognitionRequest else {
-            fatalError("Unable to create an SFSpeechAudioBufferRecognitionRequest object.")
-        }
-
-        recognitionRequest.shouldReportPartialResults = true
-
-        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest, resultHandler: { [self] result, error in
-            var isFinal = false
-
-            if let result = result {
-                self.recognizedText = result.bestTranscription.formattedString
-                isFinal = result.isFinal
-            }
-
-            if error != nil || isFinal {
-                audioEngine.stop()
-                inputNode.removeTap(onBus: 0)
-
-                recognitionRequest.endAudio()
-                recognitionTask = nil
-            }
-        })
-
         let recordingFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-            recognitionRequest.append(buffer)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
+            request.append(buffer)
         }
-
         audioEngine.prepare()
-        do {
-            try audioEngine.start()
-        } catch {
-            print("Failed to start audio engine.")
-        }
-
-        recognizedText = "请开始说话..."
+        try audioEngine.start()
+        
+        return (audioEngine, request)
     }
     
+    private func recognitionHandler(result: SFSpeechRecognitionResult?, error: Error?) {
+        let receivedFinalResult = result?.isFinal ?? false
+        let receivedError = error != nil
+        
+        if receivedFinalResult || receivedError {
+            audioEngine?.stop()
+            audioEngine?.inputNode.removeTap(onBus: 0)
+        }
+        
+        if let result = result {
+            speak(result.bestTranscription.formattedString)
+        }
+    }
+    
+    private func speak(_ message: String) {
+        transcript = message
+        print("transcript", transcript)
+    }
+    
+    private func speakError(_ error: Error) {
+        var errorMessage = ""
+        if let error = error as? RecognizerError {
+            errorMessage += error.message
+        } else {
+            errorMessage += error.localizedDescription
+        }
+        transcript = "<< \(errorMessage) >>"
+    }
+}
+
+extension SFSpeechRecognizer {
+    static func hasAuthorizationToRecognize() async -> Bool {
+        await withCheckedContinuation { continuation in
+            requestAuthorization { status in
+                continuation.resume(returning: status == .authorized)
+            }
+        }
+    }
+}
+
+extension AVAudioSession {
+    func hasPermissionToRecord() async -> Bool {
+        await withCheckedContinuation { continuation in
+            requestRecordPermission { authorized in
+                continuation.resume(returning: authorized)
+            }
+        }
+    }
 }
